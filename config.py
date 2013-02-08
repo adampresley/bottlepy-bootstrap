@@ -1,7 +1,4 @@
 import os
-import beaker
-from bottle import request
-from beaker.middleware import SessionMiddleware
 
 DEBUG = True
 BIND_TO_OUTSIDE_IP = False
