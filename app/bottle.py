@@ -16,7 +16,7 @@ License: MIT (see LICENSE for details)
 from __future__ import with_statement
 
 __author__ = 'Marcel Hellkamp'
-__version__ = '0.12-dev'
+__version__ = '0.11.rc1'
 __license__ = 'MIT'
 
 # The gevent server adapter needs to patch some modules before they are imported
@@ -122,11 +122,10 @@ if py31:
     class NCTextIOWrapper(TextIOWrapper):
         def close(self): pass # Keep wrapped buffer open.
 
-# File uploads (which are implemented as empty FiledStorage instances...)
-# have a negative truth value. That makes no sense, here is a fix.
+# The truth-value of cgi.FieldStorage is misleading.
 class FieldStorage(cgi.FieldStorage):
-    def __nonzero__(self): return bool(self.list or self.file)
-    if py3k: __bool__ = __nonzero__
+    def __nonzero__(self):
+        return bool(self.list or self.file)
 
 # A bug in functools causes it to break if the wrapper is an instance method
 def update_wrapper(wrapper, wrapped, *a, **ka):
@@ -407,7 +406,8 @@ class Router(object):
         allowed = [verb for verb in targets if verb != 'ANY']
         if 'GET' in allowed and 'HEAD' not in allowed:
             allowed.append('HEAD')
-        raise HTTPError(405, "Method not allowed.", Allow=",".join(allowed))
+        raise HTTPError(405, "Method not allowed.",
+                        header=[('Allow',",".join(allowed))])
 
 
 class Route(object):
@@ -518,10 +518,10 @@ class Bottle(object):
         #: If true, most exceptions are caught and returned as :exc:`HTTPError`
         self.catchall = catchall
 
-        #: A :class:`ResourceManager` for application files
+        #: A :cls:`ResourceManager` for application files
         self.resources = ResourceManager()
 
-        #: A :class:`ConfigDict` for app specific configuration.
+        #: A :cls:`ConfigDict` for app specific configuration.
         self.config = ConfigDict()
         self.config.autojson = autojson
 
@@ -561,14 +561,14 @@ class Bottle(object):
         def mountpoint_wrapper():
             try:
                 request.path_shift(path_depth)
-                rs = HTTPResponse([])
-                def start_response(status, headerlist):
+                rs = BaseResponse([], 200)
+                def start_response(status, header):
                     rs.status = status
-                    for name, value in headerlist: rs.add_header(name, value)
+                    for name, value in header: rs.add_header(name, value)
                     return rs.body.append
                 body = app(request.environ, start_response)
-                if body: rs.body = itertools.chain(rs.body, body)
-                return rs
+                body = itertools.chain(rs.body, body)
+                return HTTPResponse(body, rs.status_code, rs.headers)
             finally:
                 request.path_shift(-path_depth)
 
@@ -806,7 +806,7 @@ class Bottle(object):
             return self._cast(out)
         if isinstance(out, HTTPResponse):
             out.apply(response)
-            return self._cast(out.body)
+            return self._cast(out.output)
 
         # File-like objects.
         if hasattr(out, 'read'):
@@ -817,10 +817,10 @@ class Bottle(object):
 
         # Handle Iterables. We peek into them to detect their inner type.
         try:
-            iout = iter(out)
-            first = next(iout)
+            out = iter(out)
+            first = next(out)
             while not first:
-                first = next(iout)
+                first = next(out)
         except StopIteration:
             return self._cast('')
         except HTTPResponse:
@@ -834,18 +834,13 @@ class Bottle(object):
         # These are the inner types allowed in iterator or generator objects.
         if isinstance(first, HTTPResponse):
             return self._cast(first)
-        elif isinstance(first, bytes):
-            new_iter = itertools.chain([first], iout)
-        elif isinstance(first, unicode):
-            encoder = lambda x: x.encode(response.charset)
-            new_iter = imap(encoder, itertools.chain([first], iout))
-        else:
-            msg = 'Unsupported response type: %s' % type(first)
-            return self._cast(HTTPError(500, msg))
-        if hasattr(out, 'close'):
-            new_iter = _iterchain(new_iter)
-            new_iter.close = out.close
-        return new_iter
+        if isinstance(first, bytes):
+            return itertools.chain([first], out)
+        if isinstance(first, unicode):
+            return imap(lambda x: x.encode(response.charset),
+                                  itertools.chain([first], out))
+        return self._cast(HTTPError(500, 'Unsupported response type: %s'\
+                                         % type(first)))
 
     def wsgi(self, environ, start_response):
         """ The bottle WSGI-interface. """
@@ -970,7 +965,7 @@ class BaseRequest(object):
     @DictProperty('environ', 'bottle.request.forms', read_only=True)
     def forms(self):
         """ Form values parsed from an `url-encoded` or `multipart/form-data`
-            encoded POST or PUT request body. The result is returned as a
+            encoded POST or PUT request body. The result is retuned as a
             :class:`FormsDict`. All keys and values are strings. File uploads
             are stored separately in :attr:`files`. """
         forms = FormsDict()
@@ -1275,14 +1270,6 @@ class BaseResponse(object):
         This class does support dict-like case-insensitive item-access to
         headers, but is NOT a dict. Most notably, iterating over a response
         yields parts of the body and not the headers.
-
-        :param body: The response body as one of the supported types.
-        :param status: Either an HTTP status code (e.g. 200) or a status line
-                       including the reason phrase (e.g. '200 OK').
-        :param headers: A dictionary or a list of name-value pairs.
-
-        Additional keyword arguments are added to the list of headers.
-        Underscores in the header name are replaced with dashes.
     """
 
     default_status = 200
@@ -1296,25 +1283,17 @@ class BaseResponse(object):
                   'Content-Length', 'Content-Range', 'Content-Type',
                   'Content-Md5', 'Last-Modified'))}
 
-    def __init__(self, body='', status=None, headers=None, **more_headers):
+    def __init__(self, body='', status=None, **headers):
         self._cookies = None
-        self._headers = {}
+        self._headers = {'Content-Type': [self.default_content_type]}
         self.body = body
         self.status = status or self.default_status
         if headers:
-            if isinstance(headers, dict):
-                headers = headers.items()
-            for name, value in headers:
-                self.add_header(name, value)
-        if more_headers:
-            for name, value in more_headers.items():
-                self.add_header(name, value)
-        if 'Content-Type' not in self._headers:
-            self._headers['Content-Type'] = [self.default_content_type]
+            for name, value in headers.items():
+                self[name] = value
 
     def copy(self):
         ''' Returns a copy of self. '''
-        # TODO
         copy = Response()
         copy.status = self.status
         copy._headers = dict((k, v[:]) for (k, v) in self._headers.items())
@@ -1414,11 +1393,11 @@ class BaseResponse(object):
     content_length = HeaderProperty('Content-Length', reader=int)
 
     @property
-    def charset(self, default='UTF-8'):
+    def charset(self):
         """ Return the charset specified in the content-type header (default: utf8). """
         if 'charset=' in self.content_type:
             return self.content_type.split('charset=')[-1].split(';')[0].strip()
-        return default
+        return 'UTF-8'
 
     @property
     def COOKIES(self):
@@ -1541,13 +1520,12 @@ Request = BaseRequest
 Response = BaseResponse
 
 class HTTPResponse(Response, BottleException):
-    def __init__(self, body='', status=None, headers=None,
-                 header=None, **more_headers):
-        if header or 'output' in more_headers:
-            depr('Call signature changed (for the better). See BaseResponse')
-            if header: more_headers.update(header)
-            if 'output' in more_headers: body = more_headers.pop('output')
-        super(HTTPResponse, self).__init__(body, status, headers, **more_headers)
+    def __init__(self, body='', status=None, header=None, **headers):
+        if header or 'output' in headers:
+            depr('Call signature changed (for the better)')
+            if header: headers.update(header)
+            if 'output' in headers: body = headers.pop('output')
+        super(HTTPResponse, self).__init__(body, status, **headers)
 
     def apply(self, response):
         response._status_code = self._status_code
@@ -1565,11 +1543,10 @@ class HTTPResponse(Response, BottleException):
 
 class HTTPError(HTTPResponse):
     default_status = 500
-    def __init__(self, status=None, body=None, exception=None, traceback=None,
-                 **options):
+    def __init__(self, status=None, body=None, exception=None, traceback=None, header=None, **headers):
         self.exception = exception
         self.traceback = traceback
-        super(HTTPError, self).__init__(body, status, **options)
+        super(HTTPError, self).__init__(body, status, header, **headers)
 
 
 
@@ -1588,12 +1565,15 @@ class JSONPlugin(object):
     def __init__(self, json_dumps=json_dumps):
         self.json_dumps = json_dumps
 
-    def apply(self, callback, route):
+    def apply(self, callback, context):
         dumps = self.json_dumps
         if not dumps: return callback
         def wrapper(*a, **ka):
             rv = callback(*a, **ka)
-            if isinstance(rv, dict):
+            # ADAM: Why this only does dictionaries is beyond me. Should also do lists
+            #if isinstance(rv, dict):
+            # END ADAM
+            if isinstance(rv, dict) or isinstance(rv, list) or isinstance(rv, tuple):
                 #Attempt to serialize, raises exception on failure
                 json_response = dumps(rv)
                 #Set content type only if serialization succesful
@@ -1638,7 +1618,7 @@ class HooksPlugin(object):
         if ka.pop('reversed', False): hooks = hooks[::-1]
         return [hook(*a, **ka) for hook in hooks]
 
-    def apply(self, callback, route):
+    def apply(self, callback, context):
         if self._empty(): return callback
         def wrapper(*a, **ka):
             self.trigger('before_request')
@@ -1860,7 +1840,7 @@ class WSGIHeaderDict(DictMixin):
         Currently PEP 333, 444 and 3333 are supported. (PEP 444 is the only one
         that uses non-native strings.)
     '''
-    #: List of keys that do not have a ``HTTP_`` prefix.
+    #: List of keys that do not have a 'HTTP_' prefix.
     cgikeys = ('CONTENT_TYPE', 'CONTENT_LENGTH')
 
     def __init__(self, environ):
@@ -1959,11 +1939,6 @@ class WSGIFileWrapper(object):
             part = read(buff)
             if not part: return
             yield part
-
-
-class _iterchain(itertools.chain):
-    ''' This only exists to be able to attach a .close method to iterators that
-        do not support attribute assignment (most of itertools). '''
 
 
 class ResourceManager(object):
@@ -2072,7 +2047,7 @@ def redirect(url, code=None):
     if code is None:
         code = 303 if request.get('SERVER_PROTOCOL') == "HTTP/1.1" else 302
     location = urljoin(request.url, url)
-    raise HTTPResponse("", status=code, Location=location)
+    raise HTTPResponse("", status=code, header=dict(Location=location))
 
 
 def _file_iter_range(fp, offset, bytes, maxread=1024*1024):
@@ -2093,7 +2068,7 @@ def static_file(filename, root, mimetype='auto', download=False):
     """
     root = os.path.abspath(root) + os.sep
     filename = os.path.abspath(os.path.join(root, filename.strip('/\\')))
-    headers = dict()
+    header = dict()
 
     if not filename.startswith(root):
         return HTTPError(403, "Access denied.")
@@ -2104,41 +2079,41 @@ def static_file(filename, root, mimetype='auto', download=False):
 
     if mimetype == 'auto':
         mimetype, encoding = mimetypes.guess_type(filename)
-        if mimetype: headers['Content-Type'] = mimetype
-        if encoding: headers['Content-Encoding'] = encoding
+        if mimetype: header['Content-Type'] = mimetype
+        if encoding: header['Content-Encoding'] = encoding
     elif mimetype:
-        headers['Content-Type'] = mimetype
+        header['Content-Type'] = mimetype
 
     if download:
         download = os.path.basename(filename if download == True else download)
-        headers['Content-Disposition'] = 'attachment; filename="%s"' % download
+        header['Content-Disposition'] = 'attachment; filename="%s"' % download
 
     stats = os.stat(filename)
-    headers['Content-Length'] = clen = stats.st_size
+    header['Content-Length'] = clen = stats.st_size
     lm = time.strftime("%a, %d %b %Y %H:%M:%S GMT", time.gmtime(stats.st_mtime))
-    headers['Last-Modified'] = lm
+    header['Last-Modified'] = lm
 
     ims = request.environ.get('HTTP_IF_MODIFIED_SINCE')
     if ims:
         ims = parse_date(ims.split(";")[0].strip())
     if ims is not None and ims >= int(stats.st_mtime):
-        headers['Date'] = time.strftime("%a, %d %b %Y %H:%M:%S GMT", time.gmtime())
-        return HTTPResponse(status=304, **headers)
+        header['Date'] = time.strftime("%a, %d %b %Y %H:%M:%S GMT", time.gmtime())
+        return HTTPResponse(status=304, header=header)
 
     body = '' if request.method == 'HEAD' else open(filename, 'rb')
 
-    headers["Accept-Ranges"] = "bytes"
+    header["Accept-Ranges"] = "bytes"
     ranges = request.environ.get('HTTP_RANGE')
     if 'HTTP_RANGE' in request.environ:
         ranges = list(parse_range_header(request.environ['HTTP_RANGE'], clen))
         if not ranges:
             return HTTPError(416, "Requested Range Not Satisfiable")
         offset, end = ranges[0]
-        headers["Content-Range"] = "bytes %d-%d/%d" % (offset, end-1, clen)
-        headers["Content-Length"] = str(end-offset)
+        header["Content-Range"] = "bytes %d-%d/%d" % (offset, end-1, clen)
+        header["Content-Length"] = str(end-offset)
         if body: body = _file_iter_range(body, offset, end-offset)
-        return HTTPResponse(body, status=206, **headers)
-    return HTTPResponse(body, **headers)
+        return HTTPResponse(body, header=header, status=206)
+    return HTTPResponse(body, header=header)
 
 
 
@@ -2322,14 +2297,13 @@ def auth_basic(check, realm="private", text="Access denied"):
     ''' Callback decorator to require HTTP auth (basic).
         TODO: Add route(check_auth=...) parameter. '''
     def decorator(func):
-        def wrapper(*a, **ka):
-            user, password = request.auth or (None, None)
-            if user is None or not check(user, password):
-                err = HTTPError(401, text)
-                err.add_header('WWW-Authenticate', 'Basic realm="%s"' % realm)
-                return err
-            return func(*a, **ka)
-        return wrapper
+      def wrapper(*a, **ka):
+        user, password = request.auth or (None, None)
+        if user is None or not check(user, password):
+          response.headers['WWW-Authenticate'] = 'Basic realm="%s"' % realm
+          return HTTPError(401, text)
+        return func(*a, **ka)
+      return wrapper
     return decorator
 
 
@@ -2368,8 +2342,8 @@ url       = make_default_app_wrapper('get_url')
 
 class ServerAdapter(object):
     quiet = False
-    def __init__(self, host='127.0.0.1', port=8080, **options):
-        self.options = options
+    def __init__(self, host='127.0.0.1', port=8080, **config):
+        self.options = config
         self.host = host
         self.port = int(port)
 
@@ -2514,17 +2488,15 @@ class GeventServer(ServerAdapter):
 
         * `fast` (default: False) uses libevent's http server, but has some
           issues: No streaming, no pipelining, no SSL.
-        * See gevent.wsgi.WSGIServer() documentation for more options.
     """
     def run(self, handler):
         from gevent import wsgi, pywsgi, local
         if not isinstance(_lctx, local.local):
             msg = "Bottle requires gevent.monkey.patch_all() (before import)"
             raise RuntimeError(msg)
-        if not self.options.pop('fast'): wsgi = pywsgi
-        self.options['log'] = None if self.quiet else 'default'
-        address = (self.host, self.port)
-        wsgi.WSGIServer(address, handler, **self.options).serve_forever()
+        if not self.options.get('fast'): wsgi = pywsgi
+        log = None if self.quiet else 'default'
+        wsgi.WSGIServer((self.host, self.port), handler, log=log).serve_forever()
 
 
 class GunicornServer(ServerAdapter):
@@ -2829,19 +2801,11 @@ class BaseTemplate(object):
     def search(cls, name, lookup=[]):
         """ Search name in all directories specified in lookup.
         First without, then with common extensions. Return first hit. """
-        if not lookup:
-            depr('The template lookup path list should not be empty.')
-            lookup = ['.']
-
-        if os.path.isabs(name) and os.path.isfile(name):
-            depr('Absolute template path names are deprecated.')
-            return os.path.abspath(name)
-
+        if os.path.isfile(name): return name
         for spath in lookup:
-            spath = os.path.abspath(spath) + os.sep
-            fname = os.path.abspath(os.path.join(spath, name))
-            if not fname.startswith(spath): continue
-            if os.path.isfile(fname): return fname
+            fname = os.path.join(spath, name)
+            if os.path.isfile(fname):
+                return fname
             for ext in cls.extensions:
                 if os.path.isfile('%s.%s' % (fname, ext)):
                     return '%s.%s' % (fname, ext)
@@ -3127,7 +3091,7 @@ def template(*args, **kwargs):
     adapter = kwargs.pop('template_adapter', SimpleTemplate)
     lookup = kwargs.pop('template_lookup', TEMPLATE_PATH)
     tplid = (id(lookup), tpl)
-    if tplid not in TEMPLATES or DEBUG:
+    if tpl not in TEMPLATES or DEBUG:
         settings = kwargs.pop('template_settings', {})
         if isinstance(tpl, adapter):
             TEMPLATES[tplid] = tpl
@@ -3165,8 +3129,6 @@ def view(tpl_name, **defaults):
                 tplvars = defaults.copy()
                 tplvars.update(result)
                 return template(tpl_name, **tplvars)
-            elif result is None:
-                return template(tpl_name, defaults)
             return result
         return wrapper
     return decorator
@@ -3255,7 +3217,7 @@ app.push()
 
 #: A virtual package that redirects import statements.
 #: Example: ``import bottle.ext.sqlite`` actually imports `bottle_sqlite`.
-ext = _ImportRedirect('bottle.ext' if __name__ == '__main__' else __name__+".ext", 'bottle_%s').module
+ext = _ImportRedirect(__name__+'.ext', 'bottle_%s').module
 
 if __name__ == '__main__':
     opt, args, parser = _cmd_options, _cmd_args, _cmd_parser
